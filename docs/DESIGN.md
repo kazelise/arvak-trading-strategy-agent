@@ -50,6 +50,23 @@ front-matter (source, url, title, published, fetched_at, chars).
 Runtime state is never the record; files are. Auditable, re-runnable,
 diff-able.
 
+**D7 — Fetch layer is chosen per source, behind a seam.**
+The browser layer is isolated in three tiny functions (`bu` / `bu_eval` /
+`connect`); swapping it per source is a ~20-line change. Policy: keep the
+session-based fetcher for sources it already handles well; adopt specialized
+adapter tooling (e.g. opencli's ready-made desktop/web adapters) per source
+where login/anti-bot/DOM cost is high — evaluate at M1 for chat-app and
+social sources. Don't rebuild wheels at the browser layer; own the glue,
+discipline, and persistence above it.
+
+**D8 — Success envelopes lie; files don't.**
+Acceptance = inspecting artifacts on disk, never trusting `{"ok": true}`
+alone. Proven immediately: the first acceptance run returned ok while two
+section pages had been saved as posts (teaser walls passed a chars-only
+heuristic). Fixed with a second independent signal (post-body container
+presence). Rule: every content heuristic needs ≥2 independent signals, and
+every acceptance includes reading the actual output files.
+
 ## Milestones
 
 - **M0a** (this): scaffold, privacy-first config, newsletter fetcher — *done*

@@ -40,10 +40,11 @@ JS_EXTRACT_POST = (
     "let pub=m('article:published_time');"
     "if(!pub){try{const ld=JSON.parse(document.querySelector('script[type=\"application/ld+json\"]')?.textContent||'{}');"
     "pub=ld.datePublished||''}catch(e){}}"
-    "const el=document.querySelector('article .available-content')||document.querySelector('article');"
+    "const main=document.querySelector('article .available-content');"
+    "const el=main||document.querySelector('article');"
     "const t=el?el.innerText:'';"
     "return JSON.stringify({title:m('og:title')||document.querySelector('h1')?.innerText||'',"
-    "published:pub,chars:t.length,body:t})})()"
+    "published:pub,hasArticle:!!main,chars:t.length,body:t})})()"
 )
 
 
@@ -92,8 +93,16 @@ def slug_of(url: str) -> str:
 
 
 def looks_like_index(post: dict) -> bool:
-    """Section/collection pages list many teasers instead of one article."""
-    return post["chars"] < MIN_POST_CHARS and post["body"].count("Read full story") >= 2
+    """Section/collection pages: teaser walls, or no post-body container at all.
+
+    Two independent signals (either one suffices):
+    1. Multiple "Read full story" teasers → it's a card list, not an article.
+    2. Substack posts render body inside `article .available-content`; section
+       pages don't have it. Missing container + shortish text → not a post.
+    """
+    if post["body"].count("Read full story") >= 2:
+        return True
+    return not post.get("hasArticle") and post["chars"] < 3000
 
 
 def fetch_source(src: dict, latest: int) -> list[dict]:
