@@ -1,10 +1,22 @@
 # Template for config/model.local.toml (which is gitignored).
 # Copy to model.local.toml and fill in your real endpoint/key.
+#
+# `format` decides the wire dialect AND the path the script calls:
+#   "anthropic" → POST {base_url}/v1/messages          (claude-family models)
+#   "openai"    → POST {base_url}/v1/chat/completions  (gpt / most aggregator models)
+# `base_url` is the HOST ROOT — no trailing /v1, the script builds the path.
 
 [model]
-base_url = "https://api.anthropic.com"   # any Anthropic-compatible endpoint
+base_url = "https://api.anthropic.com"
+format = "anthropic"
 model = "claude-sonnet-5"
 max_tokens = 4000
 # 二选一：
 # api_key = "sk-..."
 api_key_env = "ARVAK_MODEL_API_KEY"
+
+# Aggregator example (openai dialect), commented out:
+# base_url = "https://your-aggregator.example"
+# format = "openai"
+# model = "some-gpt-model"
+# api_key = "sk-..."

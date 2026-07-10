@@ -250,35 +250,66 @@ def resolve_api_key(model_cfg: dict) -> str:
 
 
 def call_model(system: str, user: str, model_cfg: dict) -> str:
+    """Speak the wire dialect the endpoint expects.
+
+    Two dialects, same semantics (system + user in, text out):
+      anthropic → POST {base}/v1/messages         (x-api-key, system top-level)
+      openai    → POST {base}/v1/chat/completions (Bearer, system as a message)
+    This is the same idea as the Model protocol seam in my previous agent
+    project: the pipeline upstream never knows which dialect was spoken.
+    """
     api_key = resolve_api_key(model_cfg)
     base_url = model_cfg["base_url"].rstrip("/")
-    body = json.dumps({
-        "model": model_cfg["model"],
-        "max_tokens": model_cfg.get("max_tokens", 4000),
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }).encode("utf-8")
+    if base_url.endswith("/v1"):
+        base_url = base_url[: -len("/v1")].rstrip("/")
+        log("[model] note: stripped trailing /v1 from base_url — the script builds the full path itself")
+    fmt = model_cfg.get("format", "anthropic")
 
-    req = urllib.request.Request(
-        f"{base_url}/v1/messages",
-        data=body,
-        method="POST",
-        headers={
+    if fmt == "openai":
+        url = f"{base_url}/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+        body = json.dumps({
+            "model": model_cfg["model"],
+            "max_tokens": model_cfg.get("max_tokens", 4000),
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }).encode("utf-8")
+    elif fmt == "anthropic":
+        url = f"{base_url}/v1/messages"
+        headers = {
             "x-api-key": api_key,
             "anthropic-version": API_VERSION,
             "content-type": "application/json",
-        },
-    )
+        }
+        body = json.dumps({
+            "model": model_cfg["model"],
+            "max_tokens": model_cfg.get("max_tokens", 4000),
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }).encode("utf-8")
+    else:
+        raise RuntimeError(f'unknown format {fmt!r} in [model] — use "anthropic" or "openai"')
+
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:200]
-        raise RuntimeError(f"model call failed: HTTP {exc.code} — {detail}") from exc
+        raise RuntimeError(
+            f"model call failed: HTTP {exc.code} — {detail} "
+            f"(dialect={fmt}, url={url}; check: base_url should be the host root without /v1; "
+            f"format must match the model family — claude→anthropic, gpt/others→openai; "
+            f"and the model id must exist on your endpoint)"
+        ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"model call failed: {exc.reason}") from exc
 
     try:
+        if fmt == "openai":
+            return payload["choices"][0]["message"]["content"]
         return payload["content"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"unexpected model response shape: {json.dumps(payload)[:200]}") from exc
