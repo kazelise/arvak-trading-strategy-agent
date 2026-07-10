@@ -1,0 +1,10 @@
+# Template for config/model.local.toml (which is gitignored).
+# Copy to model.local.toml and fill in your real endpoint/key.
+
+[model]
+base_url = "https://api.anthropic.com"   # any Anthropic-compatible endpoint
+model = "claude-sonnet-5"
+max_tokens = 4000
+# 二选一：
+# api_key = "sk-..."
+api_key_env = "ARVAK_MODEL_API_KEY"

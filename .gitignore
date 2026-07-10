@@ -3,6 +3,9 @@
 # Real source registry (names, URLs, channel IDs) — local only
 config/sources.local.*
 
+# Model endpoint/key — local only
+config/*.local.toml
+
 # Fetched / derived content (paid subscriptions, private channels) — local only
 sources/
 journal/
