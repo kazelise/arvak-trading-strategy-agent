@@ -1,0 +1,24 @@
+# Template for config/sources.local.toml (which is gitignored).
+# Copy to sources.local.toml and fill in your real sources.
+# Convention: everything outside sources.local.toml refers to sources by `id` only.
+
+[[newsletters]]
+id = "newsletter-a"
+kind = "substack"
+url = "https://example-newsletter.substack.com"
+enabled = true
+fetch_latest = 3
+
+[discord]
+server = "000000000000000000"
+enabled = false
+
+[[discord.channels]]
+id = "sentiment-room"
+channel = "000000000000000000"
+note = "sentiment channel"
+
+[[social]]
+id = "x-a"
+url = "https://x.com/example"
+enabled = false

@@ -1,0 +1,23 @@
+# ── Privacy first: real source identities & fetched content NEVER enter git ──
+
+# Real source registry (names, URLs, channel IDs) — local only
+config/sources.local.*
+
+# Fetched / derived content (paid subscriptions, private channels) — local only
+sources/
+journal/
+
+# Secrets & env
+.env
+.env.*
+*.local
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
