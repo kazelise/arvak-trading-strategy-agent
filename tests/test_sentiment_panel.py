@@ -93,6 +93,36 @@ class EscapeHatchTests(unittest.TestCase):
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertEqual(sp._count_named_pattern_hits([sp.Sample("sentiment-paste-a", text, AS_OF)]), 1)
 
+    def test_rensheng_fanshen_single_observation_escapes(self):
+        """Exact regression: 人生翻身 must not double-count as two independent signals.
+
+        Historically 人生翻身 matched both 追涨/怕踏空 and 暴富叙事 via nested
+        翻身; span de-overlap + vocab de-overlap must yield one observation → escape.
+        """
+        filler = "今天大家在聊天气和通勤，没有别的内容。" * 8
+        text = filler + "人生翻身。" + filler
+        samples = [sp.Sample("sentiment-paste-a", text, AS_OF)]
+        self.assertEqual(sp._count_named_pattern_hits(samples), 1)
+        r = sp.classify_rules(samples, as_of=AS_OF)
+        self.assertEqual(r.index_level, "信息不足以分级")
+        self.assertIsNotNone(r.escape_reason)
+        self.assertIn("独立", r.escape_reason or "")
+        # At most one evidence item after span dedupe.
+        self.assertLessEqual(len(r.evidence), 1)
+
+    def test_overlapping_spans_dedupe_to_one(self):
+        hits = [
+            sp.MatchHit("sentiment-paste-a", "追涨/怕踏空", "FOMO", 10, 14, "翻身"),
+            sp.MatchHit("sentiment-paste-a", "暴富叙事", "FOMO", 8, 14, "人生翻身"),
+            sp.MatchHit("sentiment-paste-a", "投降/割肉", "FUD", 40, 42, "割肉"),
+        ]
+        kept = sp.dedupe_hits_by_span(hits)
+        self.assertEqual(len(kept), 2)
+        names = {h.name for h in kept}
+        self.assertIn("暴富叙事", names)  # longer span preferred
+        self.assertIn("投降/割肉", names)
+        self.assertNotIn("追涨/怕踏空", names)
+
 
 class FreshnessTests(unittest.TestCase):
     def _strong_fud(self) -> str:

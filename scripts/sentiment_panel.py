@@ -57,9 +57,15 @@ REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 # Named pattern library — closed, not open NLP. Keep abstract; no real handles.
+# Vocabulary is intentionally de-overlapped where possible (e.g. 翻身 lives only
+# under 暴富叙事). Runtime still de-duplicates overlapping match spans so one
+# observation cannot satisfy the two-signal gate via multiple rule names.
 FOMO_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("追涨/怕踏空", re.compile(r"怕踏空|踏空|追涨|上车|干就完了|all\s*in|加杠杆|梭哈|不看估值|人生翻身|必涨|要起飞|moon|FOMO", re.I)),
-    ("暴富叙事", re.compile(r"翻身|财富自由|一夜|狂飙|疯了一样买|排队入金", re.I)),
+    ("追涨/怕踏空", re.compile(
+        r"怕踏空|踏空|追涨|上车|干就完了|all\s*in|加杠杆|梭哈|不看估值|必涨|要起飞|moon|FOMO",
+        re.I,
+    )),
+    ("暴富叙事", re.compile(r"人生翻身|翻身|财富自由|一夜|狂飙|疯了一样买|排队入金", re.I)),
 )
 FUD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("投降/割肉", re.compile(r"割肉|投降|离场|再也不碰|永久退出|爆仓|崩了|完蛋|血亏|清仓跑", re.I)),
@@ -67,6 +73,13 @@ FUD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 WATCH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("观望/不敢", re.compile(r"观望|先看|不敢(追|买|做多)?|再等等|轻仓|空仓等待|静观", re.I)),
+)
+
+# (name, pattern, polarity) — single scan table for span-aware matching.
+ALL_NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    *[(n, p, "FOMO") for n, p in FOMO_PATTERNS],
+    *[(n, p, "FUD") for n, p in FUD_PATTERNS],
+    *[(n, p, "观望") for n, p in WATCH_PATTERNS],
 )
 
 
@@ -344,50 +357,102 @@ def filter_fresh_samples(
     return kept
 
 
+@dataclass(frozen=True)
+class MatchHit:
+    """One regex observation with character span for independence checks."""
+
+    source_id: str
+    name: str
+    polarity: str
+    start: int
+    end: int
+    quote_span: str
+
+    @property
+    def span_len(self) -> int:
+        return self.end - self.start
+
+
+def _collect_raw_hits(samples: list[Sample]) -> list[MatchHit]:
+    """All first-match hits per (sample, named pattern), before de-overlap."""
+    hits: list[MatchHit] = []
+    for s in samples:
+        text = s.text
+        for name, pat, polarity in ALL_NAMED_PATTERNS:
+            m = pat.search(text)
+            if not m:
+                continue
+            start, end = m.start(), m.end()
+            radius = 16
+            q0 = max(0, start - radius)
+            q1 = min(len(text), end + radius)
+            span = redact_text(text[q0:q1].replace("\n", " ").strip()[:80])
+            hits.append(
+                MatchHit(
+                    source_id=s.source_id,
+                    name=name,
+                    polarity=polarity,
+                    start=start,
+                    end=end,
+                    quote_span=span,
+                )
+            )
+    return hits
+
+
+def _spans_overlap(a: MatchHit, b: MatchHit) -> bool:
+    """True if character ranges overlap or nest (same observation)."""
+    if a.source_id != b.source_id:
+        return False
+    return a.start < b.end and b.start < a.end
+
+
+def dedupe_hits_by_span(hits: list[MatchHit]) -> list[MatchHit]:
+    """Keep independent observations only: overlapping spans collapse to one.
+
+    Prefer the longer match (more specific observation), then earlier start,
+    then stable name order. Distinct non-overlapping spans remain independent
+    even if they share a pattern name family.
+    """
+    if not hits:
+        return []
+    ordered = sorted(hits, key=lambda h: (-h.span_len, h.start, h.name))
+    kept: list[MatchHit] = []
+    for h in ordered:
+        if any(_spans_overlap(h, k) for k in kept):
+            continue
+        kept.append(h)
+    # Stable output order by source then position.
+    kept.sort(key=lambda h: (h.source_id, h.start, h.name))
+    return kept
+
+
 def scan_patterns(
     samples: list[Sample],
 ) -> tuple[list[Evidence], int, int, int]:
-    """Return (evidence, fomo_hits, fud_hits, watch_hits)."""
+    """Return (evidence, fomo_hits, fud_hits, watch_hits) after span de-overlap."""
+    independent = dedupe_hits_by_span(_collect_raw_hits(samples))
     evidence: list[Evidence] = []
     fomo = fud = watch = 0
-    for s in samples:
-        text = s.text
-        for name, pat in FOMO_PATTERNS:
-            if pat.search(text):
-                fomo += 1
-                evidence.append(
-                    Evidence(
-                        source_id=s.source_id,
-                        signal=name,
-                        quote_span=_first_match_span(pat, text),
-                        polarity="FOMO",
-                        note="规则命中：FOMO 模式库",
-                    )
-                )
-        for name, pat in FUD_PATTERNS:
-            if pat.search(text):
-                fud += 1
-                evidence.append(
-                    Evidence(
-                        source_id=s.source_id,
-                        signal=name,
-                        quote_span=_first_match_span(pat, text),
-                        polarity="FUD",
-                        note="规则命中：FUD 模式库",
-                    )
-                )
-        for name, pat in WATCH_PATTERNS:
-            if pat.search(text):
-                watch += 1
-                evidence.append(
-                    Evidence(
-                        source_id=s.source_id,
-                        signal=name,
-                        quote_span=_first_match_span(pat, text),
-                        polarity="观望",
-                        note="规则命中：观望模式库",
-                    )
-                )
+    for h in independent:
+        if h.polarity == "FOMO":
+            fomo += 1
+            note = "规则命中：FOMO 模式库（span 去重叠）"
+        elif h.polarity == "FUD":
+            fud += 1
+            note = "规则命中：FUD 模式库（span 去重叠）"
+        else:
+            watch += 1
+            note = "规则命中：观望模式库（span 去重叠）"
+        evidence.append(
+            Evidence(
+                source_id=h.source_id,
+                signal=h.name,
+                quote_span=h.quote_span,
+                polarity=h.polarity,
+                note=note,
+            )
+        )
     return evidence, fomo, fud, watch
 
 
@@ -405,18 +470,15 @@ def assess_sample_quality(samples: list[Sample]) -> tuple[str, int, str | None]:
 
 
 def _count_named_pattern_hits(samples: list[Sample]) -> int:
-    """Count distinct named patterns hit across the library (independent signals).
+    """Count independent observations after span de-overlap.
 
-    A "signal" is one named pattern entry (e.g. 追涨/怕踏空, 投降/割肉),
-    not text length. docs/SENTIMENT.md requires ≥2 independent signals for
-    every concrete (non-escape) index_level.
+    Independence is defined on non-overlapping character spans, not merely
+    distinct rule names. Overlapping multi-name matches (e.g. nested 翻身
+    variants) count as one signal. docs/SENTIMENT.md requires ≥2 independent
+    signals for every concrete (non-escape) index_level. Text length is never
+    a signal.
     """
-    names: set[str] = set()
-    for s in samples:
-        for name, pat in (*FOMO_PATTERNS, *FUD_PATTERNS, *WATCH_PATTERNS):
-            if pat.search(s.text):
-                names.add(name)
-    return len(names)
+    return len(dedupe_hits_by_span(_collect_raw_hits(samples)))
 
 
 def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelResult:
