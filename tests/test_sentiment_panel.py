@@ -156,6 +156,26 @@ class EscapeHatchTests(unittest.TestCase):
         ]
         self.assertEqual(len(sp.dedupe_hits_by_span(hits)), 2)
 
+    def test_same_source_equal_offset_no_path_not_collapsed(self):
+        """Exact reviewer reproduction: no path, same source_id, both hits at offset 0."""
+        filler = "今天大家在聊天气和通勤，没有别的内容。" * 6
+        a = sp.Sample("sentiment-paste-a", "怕踏空。" + filler, AS_OF)
+        b = sp.Sample("sentiment-paste-a", "割肉。" + filler, AS_OF)
+        self.assertIsNone(a.path)
+        self.assertIsNone(b.path)
+        # First match in each sample is at the start → equal local offsets.
+        self.assertEqual(a.text.find("怕踏空"), 0)
+        self.assertEqual(b.text.find("割肉"), 0)
+        samples = [a, b]
+        self.assertEqual(sp._count_named_pattern_hits(samples), 2)
+        r = sp.classify_rules(samples, as_of=AS_OF)
+        self.assertNotEqual(r.index_level, "信息不足以分级")
+        self.assertIsNone(r.escape_reason)
+        self.assertGreaterEqual(len(r.evidence), 2)
+        # sample_key must differ even without path (index-based).
+        keys = {sp._sample_key(a, 0), sp._sample_key(b, 1)}
+        self.assertEqual(len(keys), 2)
+
 
 class FreshnessTests(unittest.TestCase):
     def _strong_fud(self) -> str:
