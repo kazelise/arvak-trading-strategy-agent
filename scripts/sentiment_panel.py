@@ -364,8 +364,14 @@ def filter_fresh_samples(
 
 @dataclass(frozen=True)
 class MatchHit:
-    """One regex observation with character span for independence checks."""
+    """One regex observation with character span for independence checks.
 
+    `sample_key` scopes offsets to a single Sample instance. Offsets are local
+    to that sample's text, so two pastes that share a source_id but are
+    different samples must never de-overlap against each other.
+    """
+
+    sample_key: str
     source_id: str
     name: str
     polarity: str
@@ -378,11 +384,20 @@ class MatchHit:
         return self.end - self.start
 
 
+def _sample_key(sample: Sample, index: int) -> str:
+    """Stable per-sample identity for span scoping (path preferred, else index)."""
+    if sample.path:
+        return f"path:{sample.path}"
+    # Include observed_at + index so two identical-looking pastes stay distinct.
+    return f"idx:{index}|src:{sample.source_id}|obs:{sample.observed_at}"
+
+
 def _collect_raw_hits(samples: list[Sample]) -> list[MatchHit]:
     """All first-match hits per (sample, named pattern), before de-overlap."""
     hits: list[MatchHit] = []
-    for s in samples:
+    for i, s in enumerate(samples):
         text = s.text
+        skey = _sample_key(s, i)
         for name, pat, polarity in ALL_NAMED_PATTERNS:
             m = pat.search(text)
             if not m:
@@ -394,6 +409,7 @@ def _collect_raw_hits(samples: list[Sample]) -> list[MatchHit]:
             span = redact_text(text[q0:q1].replace("\n", " ").strip()[:80])
             hits.append(
                 MatchHit(
+                    sample_key=skey,
                     source_id=s.source_id,
                     name=name,
                     polarity=polarity,
@@ -406,8 +422,12 @@ def _collect_raw_hits(samples: list[Sample]) -> list[MatchHit]:
 
 
 def _spans_overlap(a: MatchHit, b: MatchHit) -> bool:
-    """True if character ranges overlap or nest (same observation)."""
-    if a.source_id != b.source_id:
+    """True if character ranges overlap or nest within the *same sample*.
+
+    Different samples (even with the same abstract source_id) are independent
+    observations; their local offsets must not be compared.
+    """
+    if a.sample_key != b.sample_key:
         return False
     return a.start < b.end and b.start < a.end
 
@@ -415,20 +435,21 @@ def _spans_overlap(a: MatchHit, b: MatchHit) -> bool:
 def dedupe_hits_by_span(hits: list[MatchHit]) -> list[MatchHit]:
     """Keep independent observations only: overlapping spans collapse to one.
 
-    Prefer the longer match (more specific observation), then earlier start,
-    then stable name order. Distinct non-overlapping spans remain independent
-    even if they share a pattern name family.
+    De-overlap is scoped per sample_key. Prefer the longer match (more specific
+    observation), then earlier start, then stable name order. Distinct samples
+    or non-overlapping spans remain independent even if they share source_id
+    or pattern family.
     """
     if not hits:
         return []
-    ordered = sorted(hits, key=lambda h: (-h.span_len, h.start, h.name))
+    ordered = sorted(hits, key=lambda h: (h.sample_key, -h.span_len, h.start, h.name))
     kept: list[MatchHit] = []
     for h in ordered:
         if any(_spans_overlap(h, k) for k in kept):
             continue
         kept.append(h)
-    # Stable output order by source then position.
-    kept.sort(key=lambda h: (h.source_id, h.start, h.name))
+    # Stable output order by sample then position.
+    kept.sort(key=lambda h: (h.sample_key, h.start, h.name))
     return kept
 
 

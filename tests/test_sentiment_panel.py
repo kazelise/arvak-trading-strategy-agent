@@ -112,9 +112,9 @@ class EscapeHatchTests(unittest.TestCase):
 
     def test_overlapping_spans_dedupe_to_one(self):
         hits = [
-            sp.MatchHit("sentiment-paste-a", "追涨/怕踏空", "FOMO", 10, 14, "翻身"),
-            sp.MatchHit("sentiment-paste-a", "暴富叙事", "FOMO", 8, 14, "人生翻身"),
-            sp.MatchHit("sentiment-paste-a", "投降/割肉", "FUD", 40, 42, "割肉"),
+            sp.MatchHit("s0", "sentiment-paste-a", "追涨/怕踏空", "FOMO", 10, 14, "翻身"),
+            sp.MatchHit("s0", "sentiment-paste-a", "暴富叙事", "FOMO", 8, 14, "人生翻身"),
+            sp.MatchHit("s0", "sentiment-paste-a", "投降/割肉", "FUD", 40, 42, "割肉"),
         ]
         kept = sp.dedupe_hits_by_span(hits)
         self.assertEqual(len(kept), 2)
@@ -122,6 +122,39 @@ class EscapeHatchTests(unittest.TestCase):
         self.assertIn("暴富叙事", names)  # longer span preferred
         self.assertIn("投降/割肉", names)
         self.assertNotIn("追涨/怕踏空", names)
+
+    def test_same_source_different_samples_not_collapsed(self):
+        """Two pastes under one abstract source_id remain independent observations.
+
+        Review regression: offsets are local per sample; same source_id + equal
+        start offsets must not de-overlap across samples.
+        """
+        filler = "今天大家在聊天气和通勤，没有别的内容。" * 6
+        # Both texts put the cue at the start so local offsets collide if
+        # de-dup is scoped only by source_id.
+        a = sp.Sample(
+            "sentiment-paste-a",
+            "怕踏空。" + filler,
+            AS_OF,
+            path="sources/raw/sentiment-paste-a/a.md",
+        )
+        b = sp.Sample(
+            "sentiment-paste-a",
+            "割肉。" + filler,
+            AS_OF,
+            path="sources/raw/sentiment-paste-a/b.md",
+        )
+        samples = [a, b]
+        self.assertEqual(sp._count_named_pattern_hits(samples), 2)
+        r = sp.classify_rules(samples, as_of=AS_OF)
+        self.assertNotEqual(r.index_level, "信息不足以分级")
+        self.assertGreaterEqual(len(r.evidence), 2)
+        # Explicit unit check on MatchHit sample_key scoping.
+        hits = [
+            sp.MatchHit("path:a", "sentiment-paste-a", "追涨/怕踏空", "FOMO", 0, 3, "怕踏空"),
+            sp.MatchHit("path:b", "sentiment-paste-a", "投降/割肉", "FUD", 0, 2, "割肉"),
+        ]
+        self.assertEqual(len(sp.dedupe_hits_by_span(hits)), 2)
 
 
 class FreshnessTests(unittest.TestCase):
