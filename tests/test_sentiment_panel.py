@@ -12,10 +12,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "sentiment_panel.py"
+AS_OF = "2026-07-12"
+AS_OF_DATE = date.fromisoformat(AS_OF)
 
 
 def load_module():
@@ -53,22 +56,22 @@ class ClosedVocabTests(unittest.TestCase):
 
 class EscapeHatchTests(unittest.TestCase):
     def test_empty_samples(self):
-        r = sp.classify_rules([])
+        r = sp.classify_rules([], as_of=AS_OF)
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertIsNotNone(r.escape_reason)
         self.assertEqual(r.sample_quality, "不可用")
         self.assertEqual(r.dominant_mode, "信息不足")
 
     def test_too_short_sample(self):
-        samples = [sp.Sample("sentiment-paste-a", "短", "2026-07-12")]
-        r = sp.classify_rules(samples)
+        samples = [sp.Sample("sentiment-paste-a", "短", AS_OF)]
+        r = sp.classify_rules(samples, as_of=AS_OF)
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertIn("过短", r.escape_reason or "")
 
     def test_long_but_no_pattern(self):
         text = "今天天气不错，大家讨论了午餐吃什么。" * 5
-        samples = [sp.Sample("sentiment-paste-a", text, "2026-07-12")]
-        r = sp.classify_rules(samples)
+        samples = [sp.Sample("sentiment-paste-a", text, AS_OF)]
+        r = sp.classify_rules(samples, as_of=AS_OF)
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertIsNotNone(r.escape_reason)
 
@@ -78,11 +81,79 @@ class EscapeHatchTests(unittest.TestCase):
         filler = "今天大家在聊天气和通勤，没有别的内容。" * 8
         text = filler + "有人说怕踏空。" + filler
         self.assertGreaterEqual(len(text), sp.MIN_THIN_CHARS)
-        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertIsNotNone(r.escape_reason)
         self.assertIn("独立", r.escape_reason or "")
-        self.assertEqual(sp._count_named_pattern_hits([sp.Sample("x", text, "2026-07-12")]), 1)
+        self.assertEqual(sp._count_named_pattern_hits([sp.Sample("sentiment-paste-a", text, AS_OF)]), 1)
+
+    def test_single_fud_keyword_only_escapes(self):
+        text = ("今天市场一般，有人提到割肉。" + "其他都在聊午饭。") * 6
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
+        self.assertEqual(r.index_level, "信息不足以分级")
+        self.assertEqual(sp._count_named_pattern_hits([sp.Sample("sentiment-paste-a", text, AS_OF)]), 1)
+
+
+class FreshnessTests(unittest.TestCase):
+    def _strong_fud(self) -> str:
+        return (
+            "彻底割肉了，再也不碰，心态崩了，市场没救了，永久退出。"
+            "又爆仓了，恐慌盘出不来，血亏清仓跑。"
+            "归零风险太大，泡沫破裂闪崩，FUD 满天飞，投降了。"
+        )
+
+    def test_stale_samples_escape(self):
+        old = (AS_OF_DATE - timedelta(days=sp.MAX_SAMPLE_AGE_DAYS + 30)).isoformat()
+        r = sp.classify_rules(
+            [sp.Sample("sentiment-paste-a", self._strong_fud(), old)],
+            as_of=AS_OF,
+        )
+        self.assertEqual(r.index_level, "信息不足以分级")
+        self.assertIn("过旧", r.escape_reason or "")
+        self.assertIn("freshness_gate", r.triggers_fired)
+
+    def test_future_dated_samples_escape(self):
+        future = (AS_OF_DATE + timedelta(days=3)).isoformat()
+        r = sp.classify_rules(
+            [sp.Sample("sentiment-paste-a", self._strong_fud(), future)],
+            as_of=AS_OF,
+        )
+        self.assertEqual(r.index_level, "信息不足以分级")
+        self.assertIn("未来", r.escape_reason or "")
+
+    def test_fresh_window_boundary_inclusive(self):
+        edge = (AS_OF_DATE - timedelta(days=sp.MAX_SAMPLE_AGE_DAYS)).isoformat()
+        r = sp.classify_rules(
+            [sp.Sample("sentiment-paste-a", self._strong_fud(), edge)],
+            as_of=AS_OF,
+        )
+        self.assertIn(r.index_level, {"冰点", "低迷"})
+        self.assertIsNone(r.escape_reason)
+
+    def test_invalid_as_of_raises(self):
+        with self.assertRaises(ValueError):
+            sp.classify_rules(
+                [sp.Sample("sentiment-paste-a", self._strong_fud(), AS_OF)],
+                as_of="not-a-date",
+            )
+
+    def test_stale_mixed_with_fresh_uses_fresh_only(self):
+        old = (AS_OF_DATE - timedelta(days=60)).isoformat()
+        # Stale is extreme FOMO; fresh is FUD — result should follow fresh FUD.
+        fomo = (
+            "怕踏空了赶紧上车，干就完了 all in 加杠杆梭哈。"
+            "不看估值要起飞，人生翻身财富自由，moon 了。"
+            "排队入金狂飙，疯了一样买，必涨叙事。"
+        )
+        r = sp.classify_rules(
+            [
+                sp.Sample("sentiment-paste-a", fomo, old),
+                sp.Sample("sentiment-paste-a", self._strong_fud(), AS_OF),
+            ],
+            as_of=AS_OF,
+        )
+        self.assertIn(r.index_level, {"冰点", "低迷"})
+        self.assertEqual(r.dominant_mode, "FUD")
 
 
 class BoundaryClassificationTests(unittest.TestCase):
@@ -92,7 +163,7 @@ class BoundaryClassificationTests(unittest.TestCase):
             "又爆仓了，恐慌盘出不来，血亏清仓跑。"
             "归零风险太大，泡沫破裂闪崩，FUD 满天飞，投降了。"
         )
-        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
         self.assertIn(r.index_level, {"冰点", "低迷"})
         self.assertEqual(r.dominant_mode, "FUD")
         self.assertGreaterEqual(len(r.evidence), 2)
@@ -104,7 +175,7 @@ class BoundaryClassificationTests(unittest.TestCase):
             "不看估值要起飞，人生翻身财富自由，moon 了。"
             "排队入金狂飙，疯了一样买，必涨叙事。"
         )
-        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
         self.assertIn(r.index_level, {"亢奋", "狂热"})
         self.assertEqual(r.dominant_mode, "FOMO")
         self.assertIsNone(r.escape_reason)
@@ -116,7 +187,7 @@ class BoundaryClassificationTests(unittest.TestCase):
             "还有人说先观望不敢追，再等等。"
             "多空都很吵，谁也没压过谁。"
         )
-        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
         # ≥2 named signals → concrete level (mixed leans 中性 or mild tilt).
         self.assertIn(r.index_level, {"中性", "低迷", "亢奋"})
         self.assertNotEqual(r.index_level, "信息不足以分级")
@@ -128,7 +199,7 @@ class BoundaryClassificationTests(unittest.TestCase):
             "今天先观望吧，不敢追，再等等，轻仓看看，空仓等待，静观其变。"
             "也有人割肉离场，心态崩了，再也不碰。"
         )
-        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
         self.assertIn(r.index_level, {"中性", "低迷"})
         self.assertNotIn(r.index_level, {"冰点", "狂热", "信息不足以分级"})
 
@@ -138,10 +209,10 @@ class BoundaryClassificationTests(unittest.TestCase):
             "今天先观望吧，不敢追，再等等，轻仓看看，空仓等待，静观其变。"
             "讨论量一般，没有一边倒的情绪集群。"
         )
-        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, AS_OF)], as_of=AS_OF)
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertEqual(
-            sp._count_named_pattern_hits([sp.Sample("x", text, "2026-07-12")]), 1
+            sp._count_named_pattern_hits([sp.Sample("sentiment-paste-a", text, AS_OF)]), 1
         )
 
 
@@ -265,6 +336,69 @@ class PrivacyGuardTests(unittest.TestCase):
         # Real product marketing names should not be hardcoded as defaults.
         for banned in ("discord.com", "x.com/", "xiaohongshu", "xueqiu.com"):
             self.assertNotIn(banned, src.lower())
+
+    def test_non_abstract_source_id_normalized(self):
+        sid = sp.normalize_source_id("My Real Trading Room #alpha")
+        self.assertEqual(sid, sp.DEFAULT_SOURCE_ID)
+        self.assertTrue(sp.ABSTRACT_SOURCE_ID_RE.fullmatch(sid))
+
+    def test_abstract_source_ids_preserved(self):
+        for good in (
+            "sentiment-paste-a",
+            "sentiment-room-b",
+            "social-a",
+            "newsletter-a",
+            "research-b",
+        ):
+            self.assertEqual(sp.normalize_source_id(good), good)
+
+    def test_identity_bearing_fixture_redacted_in_output(self):
+        # Realistic identity-bearing paste: channel-ish name + handle + URL + snowflake.
+        raw = (
+            "---\n"
+            "source: RealAlphaChat-VIP\n"
+            "observed_at: 2026-07-12\n"
+            "---\n\n"
+            "@trader_whale 在 https://example-social.test/u/whale 说怕踏空要上车，"
+            "频道 id 123456789012345 里也有人割肉离场，心态崩了再也不碰。\n"
+        )
+        sample = sp.sample_from_text(raw)
+        self.assertEqual(sample.source_id, sp.DEFAULT_SOURCE_ID)
+        r = sp.classify_rules([sample], as_of=AS_OF)
+        data = r.as_dict()
+        blob = json.dumps(data, ensure_ascii=False)
+        self.assertNotIn("RealAlphaChat-VIP", blob)
+        self.assertNotIn("@trader_whale", blob)
+        self.assertNotIn("https://example-social.test", blob)
+        self.assertNotIn("123456789012345", blob)
+        for sid in data["source_ids"]:
+            self.assertTrue(sp.ABSTRACT_SOURCE_ID_RE.fullmatch(sid), sid)
+        for ev in data["evidence"]:
+            self.assertTrue(sp.ABSTRACT_SOURCE_ID_RE.fullmatch(ev["source_id"]))
+            self.assertNotIn("@", ev.get("quote_span", ""))
+            self.assertNotIn("http", ev.get("quote_span", "").lower())
+
+    def test_parent_dir_non_abstract_falls_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            # Parent dir looks like a real room name — must not leak.
+            room = Path(td) / "VIP-Alpha-Room"
+            room.mkdir()
+            p = room / "sample.md"
+            p.write_text(
+                "---\nobserved_at: 2026-07-12\n---\n\n"
+                "怕踏空上车，同时有人割肉离场心态崩了再也不碰。\n",
+                encoding="utf-8",
+            )
+            samples = sp.load_samples_from_path(p)
+            self.assertEqual(samples[0].source_id, sp.DEFAULT_SOURCE_ID)
+
+    def test_redact_text_strips_handles_urls_ids(self):
+        text = "见 @alice 与 https://foo.test/x 以及 998877665544 id"
+        out = sp.redact_text(text)
+        self.assertNotIn("@alice", out)
+        self.assertNotIn("https://foo.test", out)
+        self.assertNotIn("998877665544", out)
+        self.assertIn("[REDACTED]", out)
 
 
 if __name__ == "__main__":

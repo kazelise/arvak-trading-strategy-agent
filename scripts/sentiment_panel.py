@@ -35,6 +35,26 @@ POLARITIES = frozenset({"FUD", "FOMO", "观望", "中性", "噪声"})
 ESCAPE_LEVEL = "信息不足以分级"
 MIN_USABLE_CHARS = 40
 MIN_THIN_CHARS = 120
+# Freshness window relative to panel as_of (docs/SENTIMENT.md escape: 过旧).
+MAX_SAMPLE_AGE_DAYS = 7
+# Allow small clock skew / same-day timezone drift; future beyond this → escape.
+MAX_FUTURE_DAYS = 0
+DEFAULT_SOURCE_ID = "sentiment-paste-a"
+
+# Abstract source-id shape only (D2). Real channel/account names are rejected.
+ABSTRACT_SOURCE_ID_RE = re.compile(
+    r"^(?:sentiment-paste|sentiment-room|social|newsletter|research)"
+    r"-[a-z0-9]+(?:-[a-z0-9]+)*$"
+)
+
+# Redact handles / @mentions / bare URLs / long digit IDs from quote spans.
+REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"https?://\S+", re.I),
+    re.compile(r"www\.\S+", re.I),
+    re.compile(r"@[\w.\u4e00-\u9fff]{2,}"),
+    re.compile(r"#\w{2,}"),
+    re.compile(r"\b\d{10,}\b"),  # snowflake-like / long numeric ids
+)
 
 # Named pattern library — closed, not open NLP. Keep abstract; no real handles.
 FOMO_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -167,6 +187,40 @@ def _default_observed_at() -> str:
     return date.today().isoformat()
 
 
+def parse_iso_date(value: str, *, field_name: str = "date") -> date:
+    """Parse YYYY-MM-DD (or longer ISO prefix). Raises ValueError on failure."""
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError(f"{field_name} is empty")
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is not a valid ISO date: {value!r}") from exc
+
+
+def normalize_source_id(raw: str | None, *, fallback: str = DEFAULT_SOURCE_ID) -> str:
+    """Accept only abstract ids; map anything else to the default paste id.
+
+    Real channel/account/server names must never leave the adapter (D2).
+    """
+    if raw is None:
+        return fallback
+    candidate = raw.strip()
+    if ABSTRACT_SOURCE_ID_RE.fullmatch(candidate):
+        return candidate
+    if candidate:
+        log(f"[privacy] rejected non-abstract source id {candidate!r} → {fallback}")
+    return fallback
+
+
+def redact_text(text: str) -> str:
+    """Strip handles, URLs, and long numeric ids from excerpts before emit."""
+    out = text
+    for pat in REDACT_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
+
+
 def sample_from_text(
     text: str,
     *,
@@ -175,29 +229,33 @@ def sample_from_text(
     path: str | None = None,
 ) -> Sample:
     meta, body = parse_front_matter(text)
-    sid = source_id or meta.get("source") or "sentiment-paste-a"
-    observed = (
+    # Prefer explicit CLI override; never trust free-form front-matter names
+    # unless they already match the abstract-id shape.
+    sid = normalize_source_id(source_id or meta.get("source") or DEFAULT_SOURCE_ID)
+    observed_raw = (
         meta.get("observed_at")
         or meta.get("published")
         or meta.get("fetched_at", "")[:10]
         or _default_observed_at()
     )
+    # Validate early so bad dates surface as structured errors, not silent today.
+    observed_date = parse_iso_date(str(observed_raw)[:10], field_name="observed_at")
     return Sample(
         source_id=sid,
         text=body.strip() if meta else text.strip(),
-        observed_at=observed[:10] if observed else _default_observed_at(),
+        observed_at=observed_date.isoformat(),
         origin=meta.get("origin") or origin,
         path=path,
     )
 
 
-def _infer_source_id(path: Path, override: str | None) -> str | None:
+def _infer_source_id(path: Path, override: str | None) -> str:
     if override:
-        return override
+        return normalize_source_id(override)
     parent = path.parent.name
     if parent and parent not in {".", "raw", "sources", "tmp", "temp"}:
-        return parent
-    return None
+        return normalize_source_id(parent)
+    return DEFAULT_SOURCE_ID
 
 
 def load_samples_from_path(path: Path, source_id: str | None = None) -> list[Sample]:
@@ -226,7 +284,64 @@ def _first_match_span(pattern: re.Pattern[str], text: str, radius: int = 16) -> 
     start = max(0, m.start() - radius)
     end = min(len(text), m.end() + radius)
     span = text[start:end].replace("\n", " ").strip()
-    return span[:80]
+    return redact_text(span[:80])
+
+
+def assess_freshness(
+    samples: list[Sample],
+    *,
+    as_of: date,
+    max_age_days: int = MAX_SAMPLE_AGE_DAYS,
+) -> str | None:
+    """Return escape_reason if samples are unusable for as_of, else None.
+
+    Rules (docs/SENTIMENT.md):
+    - unparseable observed_at → escape (caller should have validated already)
+    - any sample observed_at > as_of + MAX_FUTURE_DAYS → escape (future-dated)
+    - all samples older than max_age_days relative to as_of → escape (过旧)
+    - mix of fresh + stale: keep going; stale ones are filtered by caller if needed
+    """
+    if not samples:
+        return "样本集合为空"
+
+    ages: list[int] = []
+    for s in samples:
+        try:
+            obs = parse_iso_date(s.observed_at, field_name="observed_at")
+        except ValueError:
+            return f"样本 observed_at 无法解析: {s.observed_at!r}"
+        delta = (as_of - obs).days
+        if delta < -MAX_FUTURE_DAYS:
+            return f"样本 observed_at 晚于 as_of（未来日期）: {s.observed_at} > {as_of.isoformat()}"
+        ages.append(delta)
+
+    fresh = [a for a in ages if 0 <= a <= max_age_days]
+    if not fresh:
+        oldest = max(ages) if ages else -1
+        return (
+            f"样本全部过旧：相对 as_of={as_of.isoformat()} 均超过 "
+            f"{max_age_days} 天（最旧偏移 {oldest} 天）"
+        )
+    return None
+
+
+def filter_fresh_samples(
+    samples: list[Sample],
+    *,
+    as_of: date,
+    max_age_days: int = MAX_SAMPLE_AGE_DAYS,
+) -> list[Sample]:
+    """Keep only samples within [as_of - max_age_days, as_of + MAX_FUTURE_DAYS]."""
+    kept: list[Sample] = []
+    for s in samples:
+        try:
+            obs = parse_iso_date(s.observed_at, field_name="observed_at")
+        except ValueError:
+            continue
+        delta = (as_of - obs).days
+        if -MAX_FUTURE_DAYS <= delta <= max_age_days:
+            kept.append(s)
+    return kept
 
 
 def scan_patterns(
@@ -307,15 +422,69 @@ def _count_named_pattern_hits(samples: list[Sample]) -> int:
 def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelResult:
     """rules_v0: closed pattern counts → index_level. Intentionally coarse.
 
-    Hard rule (docs/SENTIMENT.md): every concrete level needs ≥2 independent
-    named-pattern signals. Text length is coverage/quality only — never a
-    substitute signal.
+    Hard rules (docs/SENTIMENT.md):
+    - every concrete level needs ≥2 independent named-pattern signals
+    - text length is coverage/quality only — never a substitute signal
+    - samples must fall inside the freshness window relative to as_of
+    - emitted source_ids are abstract only; quote spans are redacted
     """
-    as_of = as_of or _default_observed_at()
-    source_ids = sorted({s.source_id for s in samples})
-    quality, total_chars, early = assess_sample_quality(samples)
-    evidence, fomo, fud, watch = scan_patterns(samples)
-    independent_signals = _count_named_pattern_hits(samples)
+    as_of_str = as_of or _default_observed_at()
+    as_of_date = parse_iso_date(as_of_str, field_name="as_of")
+    as_of_str = as_of_date.isoformat()
+
+    # Normalize source ids at the panel boundary (defense in depth).
+    samples = [
+        Sample(
+            source_id=normalize_source_id(s.source_id),
+            text=s.text,
+            observed_at=s.observed_at,
+            origin=s.origin,
+            path=s.path,
+        )
+        for s in samples
+    ]
+
+    freshness_reason = assess_freshness(samples, as_of=as_of_date)
+    if freshness_reason:
+        source_ids = sorted({s.source_id for s in samples})
+        return PanelResult(
+            index_level=ESCAPE_LEVEL,
+            dominant_mode="信息不足",
+            confidence="低",
+            sample_quality="不可用",
+            as_of=as_of_str,
+            method="rules_v0",
+            sample_count=len(samples),
+            source_ids=source_ids,
+            evidence=[],
+            triggers_fired=["freshness_gate"],
+            escape_reason=freshness_reason,
+            llm_status="not_invoked",
+        )
+
+    # Drop out-of-window samples so grading uses only the falsifiable window.
+    windowed = filter_fresh_samples(samples, as_of=as_of_date)
+    if not windowed:
+        source_ids = sorted({s.source_id for s in samples})
+        return PanelResult(
+            index_level=ESCAPE_LEVEL,
+            dominant_mode="信息不足",
+            confidence="低",
+            sample_quality="不可用",
+            as_of=as_of_str,
+            method="rules_v0",
+            sample_count=len(samples),
+            source_ids=source_ids,
+            evidence=[],
+            triggers_fired=["freshness_gate"],
+            escape_reason="新鲜度窗口内无可用样本",
+            llm_status="not_invoked",
+        )
+
+    source_ids = sorted({s.source_id for s in windowed})
+    quality, total_chars, early = assess_sample_quality(windowed)
+    evidence, fomo, fud, watch = scan_patterns(windowed)
+    independent_signals = _count_named_pattern_hits(windowed)
     triggers: list[str] = []
     llm_status = "not_invoked"
 
@@ -325,9 +494,9 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
             dominant_mode="信息不足",
             confidence="低",
             sample_quality=quality,
-            as_of=as_of,
+            as_of=as_of_str,
             method="rules_v0",
-            sample_count=len(samples),
+            sample_count=len(windowed),
             source_ids=source_ids,
             evidence=evidence,
             triggers_fired=[],
@@ -370,9 +539,9 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
             dominant_mode=dominant if independent_signals else "信息不足",
             confidence="低",
             sample_quality=quality,
-            as_of=as_of,
+            as_of=as_of_str,
             method="rules_v0",
-            sample_count=len(samples),
+            sample_count=len(windowed),
             source_ids=source_ids,
             evidence=evidence,
             triggers_fired=triggers,
@@ -416,9 +585,9 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
         dominant_mode=dominant,
         confidence=confidence,
         sample_quality=quality,
-        as_of=as_of,
+        as_of=as_of_str,
         method="rules_v0",
-        sample_count=len(samples),
+        sample_count=len(windowed),
         source_ids=source_ids,
         evidence=evidence,
         triggers_fired=triggers,
@@ -537,7 +706,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         log(f"[input] {len(samples)} sample(s); method={args.method}")
-        as_of = args.as_of or _default_observed_at()
+        if args.as_of:
+            as_of = parse_iso_date(args.as_of, field_name="as_of").isoformat()
+        else:
+            as_of = _default_observed_at()
 
         if args.method == "rules":
             result = classify_rules(samples, as_of=as_of)
