@@ -12,7 +12,9 @@ config/    sources.example.toml (template) · sources.local.toml (real, gitignor
 scripts/   stdlib-only Python tools; shared {"ok":…} stdout protocol
 sources/   fetched raw material (gitignored — paid content stays local)
 journal/   generated daily briefs (gitignored)
-docs/      DESIGN.md — decision log
+prompts/   prompt-as-data (daily brief, sentiment panel, …)
+docs/      DESIGN.md · BRIEF_SPEC.md · SENTIMENT.md
+tests/     stdlib unittest skeletons
 ```
 
 ## Quickstart
@@ -21,6 +23,8 @@ docs/      DESIGN.md — decision log
 cp config/sources.example.toml config/sources.local.toml   # fill in your sources
 python3 scripts/fetch_substack.py --smoke                  # connectivity check
 python3 scripts/fetch_substack.py                          # fetch latest posts
+python3 scripts/sentiment_panel.py --smoke                 # 宝妈指数 panel skeleton
+python3 -m unittest tests/test_sentiment_panel.py -v
 ```
 
 Requires Python ≥ 3.11 and [`browser-use`](https://github.com/browser-use/browser-use)

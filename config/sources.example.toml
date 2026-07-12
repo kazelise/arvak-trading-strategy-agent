@@ -22,3 +22,10 @@ note = "sentiment channel"
 id = "x-a"
 url = "https://x.com/example"
 enabled = false
+
+# Manual sentiment pastes (M2-prep). No crawler — operator pastes text locally.
+# Files land under sources/raw/<id>/ (gitignored). See docs/SENTIMENT.md.
+[[sentiment_pastes]]
+id = "sentiment-paste-a"
+enabled = true
+note = "manual paste adapter only; abstract id, never a real channel name"
