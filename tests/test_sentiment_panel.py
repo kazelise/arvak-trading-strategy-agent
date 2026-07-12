@@ -72,6 +72,18 @@ class EscapeHatchTests(unittest.TestCase):
         self.assertEqual(r.index_level, "信息不足以分级")
         self.assertIsNotNone(r.escape_reason)
 
+    def test_long_single_named_pattern_escapes(self):
+        """Length is not a sentiment signal; one named pattern → escape."""
+        # Long neutral prose + a single FOMO cue (only 追涨/怕踏空 family).
+        filler = "今天大家在聊天气和通勤，没有别的内容。" * 8
+        text = filler + "有人说怕踏空。" + filler
+        self.assertGreaterEqual(len(text), sp.MIN_THIN_CHARS)
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        self.assertEqual(r.index_level, "信息不足以分级")
+        self.assertIsNotNone(r.escape_reason)
+        self.assertIn("独立", r.escape_reason or "")
+        self.assertEqual(sp._count_named_pattern_hits([sp.Sample("x", text, "2026-07-12")]), 1)
+
 
 class BoundaryClassificationTests(unittest.TestCase):
     def test_strong_fud_maps_to_ice_or_low(self):
@@ -83,7 +95,8 @@ class BoundaryClassificationTests(unittest.TestCase):
         r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
         self.assertIn(r.index_level, {"冰点", "低迷"})
         self.assertEqual(r.dominant_mode, "FUD")
-        self.assertGreaterEqual(len(r.evidence), 1)
+        self.assertGreaterEqual(len(r.evidence), 2)
+        self.assertIsNone(r.escape_reason)
 
     def test_strong_fomo_maps_to_hot_or_mania(self):
         text = (
@@ -94,8 +107,9 @@ class BoundaryClassificationTests(unittest.TestCase):
         r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
         self.assertIn(r.index_level, {"亢奋", "狂热"})
         self.assertEqual(r.dominant_mode, "FOMO")
+        self.assertIsNone(r.escape_reason)
 
-    def test_mixed_signals_map_to_neutral_or_escape(self):
+    def test_mixed_signals_map_to_neutral_or_concrete(self):
         text = (
             "一边有人割肉投降说再也不碰，"
             "一边有人怕踏空要上车追涨，"
@@ -103,19 +117,32 @@ class BoundaryClassificationTests(unittest.TestCase):
             "多空都很吵，谁也没压过谁。"
         )
         r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
-        # Mixed → 中性 is preferred; escape only if signal math fails.
-        self.assertIn(r.index_level, {"中性", "信息不足以分级", "低迷", "亢奋"})
+        # ≥2 named signals → concrete level (mixed leans 中性 or mild tilt).
+        self.assertIn(r.index_level, {"中性", "低迷", "亢奋"})
+        self.assertNotEqual(r.index_level, "信息不足以分级")
         data = r.as_dict()
         self.assertIn(data["index_level"], sp.INDEX_LEVELS)
 
-    def test_watch_only_not_extreme(self):
+    def test_two_named_signals_required_for_watch_plus_fud(self):
         text = (
             "今天先观望吧，不敢追，再等等，轻仓看看，空仓等待，静观其变。"
-            "没有人喊必涨，也没有人说归零。"
+            "也有人割肉离场，心态崩了，再也不碰。"
         )
         r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
         self.assertIn(r.index_level, {"中性", "低迷"})
-        self.assertNotIn(r.index_level, {"冰点", "狂热"})
+        self.assertNotIn(r.index_level, {"冰点", "狂热", "信息不足以分级"})
+
+    def test_single_watch_family_escapes(self):
+        # Only the 观望/不敢 named pattern; avoid FOMO/FUD keywords entirely.
+        text = (
+            "今天先观望吧，不敢追，再等等，轻仓看看，空仓等待，静观其变。"
+            "讨论量一般，没有一边倒的情绪集群。"
+        )
+        r = sp.classify_rules([sp.Sample("sentiment-paste-a", text, "2026-07-12")])
+        self.assertEqual(r.index_level, "信息不足以分级")
+        self.assertEqual(
+            sp._count_named_pattern_hits([sp.Sample("x", text, "2026-07-12")]), 1
+        )
 
 
 class AdapterAndProtocolTests(unittest.TestCase):
@@ -138,13 +165,14 @@ class AdapterAndProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "sample.md"
             p.write_text(
-                "割肉离场了，心态崩了，再也不碰。" * 3,
+                "割肉离场了，心态崩了，再也不碰，恐慌没救了，归零风险，FUD。" * 2,
                 encoding="utf-8",
             )
             samples = sp.load_samples_from_path(p, source_id="sentiment-paste-a")
             self.assertEqual(len(samples), 1)
             r = sp.classify_rules(samples)
             self.assertIn(r.index_level, sp.INDEX_LEVELS)
+            self.assertNotEqual(r.index_level, "信息不足以分级")
 
     def test_smoke_cli(self):
         proc = subprocess.run(
@@ -159,6 +187,7 @@ class AdapterAndProtocolTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn(payload["data"]["index_level"], sp.INDEX_LEVELS)
         self.assertTrue(payload["data"].get("smoke"))
+        self.assertTrue(proc.stderr.strip())
 
     def test_cli_missing_input_fails_structured(self):
         proc = subprocess.run(
@@ -173,9 +202,46 @@ class AdapterAndProtocolTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("error", payload)
         self.assertIn("hint", payload)
+        # Protocol: diagnostics on stderr for handled failures.
+        self.assertTrue(proc.stderr.strip(), msg="stderr must carry human diagnostics")
+        self.assertIn("[error]", proc.stderr)
+
+    def test_cli_invalid_method_choice_json(self):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "--method", "bogus"],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
+        self.assertIn("hint", payload)
+        self.assertTrue(proc.stderr.strip())
+        self.assertIn("[args]", proc.stderr)
+
+    def test_cli_unknown_flag_json(self):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), "--not-a-real-flag"],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
+        self.assertTrue(proc.stderr.strip())
 
     def test_llm_method_reserved(self):
-        text = "先观望吧不敢追，再等等，轻仓看看市场。" * 3
+        # Need ≥2 named signals so rules fallback is a concrete level.
+        text = (
+            "先观望吧不敢追，再等等，轻仓看看市场。"
+            "同时也有人割肉离场，心态崩了，再也不碰。"
+        ) * 2
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), "--method", "llm", "--text", text],
             capture_output=True,
@@ -188,6 +254,7 @@ class AdapterAndProtocolTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"]["llm_status"], "reserved")
         self.assertIn(payload["data"]["index_level"], sp.INDEX_LEVELS)
+        self.assertTrue(proc.stderr.strip())
 
 
 class PrivacyGuardTests(unittest.TestCase):

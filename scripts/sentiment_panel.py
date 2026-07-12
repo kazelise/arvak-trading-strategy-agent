@@ -123,6 +123,25 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Argparse that never bypasses the shared {"ok":…} stdout protocol."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        log(f"[args] {message}")
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": message,
+                    "hint": "Check flags: --smoke | --input PATH | --text '…'; "
+                    "--method rules|llm|rules+llm. See docs/SENTIMENT.md.",
+                },
+                ensure_ascii=False,
+            )
+        )
+        sys.exit(2)
+
+
 def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
     """Hand-rolled front matter (no yaml dep, D4). Same spirit as build_brief."""
     if not text.startswith("---"):
@@ -270,12 +289,33 @@ def assess_sample_quality(samples: list[Sample]) -> tuple[str, int, str | None]:
     return "可用", total, None
 
 
+def _count_named_pattern_hits(samples: list[Sample]) -> int:
+    """Count distinct named patterns hit across the library (independent signals).
+
+    A "signal" is one named pattern entry (e.g. 追涨/怕踏空, 投降/割肉),
+    not text length. docs/SENTIMENT.md requires ≥2 independent signals for
+    every concrete (non-escape) index_level.
+    """
+    names: set[str] = set()
+    for s in samples:
+        for name, pat in (*FOMO_PATTERNS, *FUD_PATTERNS, *WATCH_PATTERNS):
+            if pat.search(s.text):
+                names.add(name)
+    return len(names)
+
+
 def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelResult:
-    """rules_v0: closed pattern counts → index_level. Intentionally coarse."""
+    """rules_v0: closed pattern counts → index_level. Intentionally coarse.
+
+    Hard rule (docs/SENTIMENT.md): every concrete level needs ≥2 independent
+    named-pattern signals. Text length is coverage/quality only — never a
+    substitute signal.
+    """
     as_of = as_of or _default_observed_at()
     source_ids = sorted({s.source_id for s in samples})
     quality, total_chars, early = assess_sample_quality(samples)
     evidence, fomo, fud, watch = scan_patterns(samples)
+    independent_signals = _count_named_pattern_hits(samples)
     triggers: list[str] = []
     llm_status = "not_invoked"
 
@@ -295,22 +335,15 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
             llm_status=llm_status,
         )
 
-    independent_signals = sum(1 for n in (fomo, fud, watch) if n > 0)
-    # Also count raw length as a weak coverage signal when patterns hit.
-    if total_chars >= MIN_THIN_CHARS and independent_signals >= 1:
-        coverage_bonus = 1
-    else:
-        coverage_bonus = 0
-    signal_strength = independent_signals + coverage_bonus
-
     if fomo:
         triggers.append(f"FOMO模式命中×{fomo}")
     if fud:
         triggers.append(f"FUD模式命中×{fud}")
     if watch:
         triggers.append(f"观望模式命中×{watch}")
+    triggers.append(f"独立具名信号×{independent_signals}")
 
-    # Dominant mode
+    # Dominant mode (descriptive even when we later escape).
     if fomo == 0 and fud == 0 and watch == 0:
         dominant = "信息不足"
     elif fomo > 0 and fud > 0 and abs(fomo - fud) <= 1:
@@ -324,12 +357,17 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
     else:
         dominant = "混合"
 
-    # Escape if not enough independent signals for a non-neutral claim.
-    # Neutral is allowed with weaker evidence; extremes need stronger.
-    if independent_signals == 0:
+    # Hard escape: every concrete level needs ≥2 independent named signals.
+    # Length/coverage is not a signal (review blocker #1).
+    if independent_signals < 2:
+        reason = (
+            "未命中任何具名情绪模式，独立信号不足"
+            if independent_signals == 0
+            else "独立具名信号不足 2 条，不足以给出具体分档"
+        )
         return PanelResult(
             index_level=ESCAPE_LEVEL,
-            dominant_mode="信息不足",
+            dominant_mode=dominant if independent_signals else "信息不足",
             confidence="低",
             sample_quality=quality,
             as_of=as_of,
@@ -338,11 +376,11 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
             source_ids=source_ids,
             evidence=evidence,
             triggers_fired=triggers,
-            escape_reason="未命中任何具名情绪模式，独立信号不足",
+            escape_reason=reason,
             llm_status=llm_status,
         )
 
-    # Map counts → level (coarse placeholder).
+    # Map counts → level (coarse placeholder); only reached with ≥2 signals.
     if fud >= 3 and fud > fomo * 2 and watch <= fud:
         level = "冰点"
         triggers.append("投降/恐慌话术占主导")
@@ -356,7 +394,6 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
         level = "亢奋"
         triggers.append("追涨/怕踏空话术占优")
     elif watch > 0 and watch >= fomo and watch >= fud and max(fomo, fud) <= 1:
-        # Pure watchfulness without strong tilt → 低迷 if mild FUD tag else 中性
         if fud > 0:
             level = "低迷"
             triggers.append("观望偏空")
@@ -366,23 +403,6 @@ def classify_rules(samples: list[Sample], *, as_of: str | None = None) -> PanelR
     else:
         level = "中性"
         triggers.append("多空信号并存或倾斜不足")
-
-    # Extremes require ≥2 independent signal kinds OR repeated hits; else escape.
-    if level in {"冰点", "狂热"} and signal_strength < 2 and max(fomo, fud) < 3:
-        return PanelResult(
-            index_level=ESCAPE_LEVEL,
-            dominant_mode=dominant if dominant in DOMINANT_MODES else "信息不足",
-            confidence="低",
-            sample_quality=quality,
-            as_of=as_of,
-            method="rules_v0",
-            sample_count=len(samples),
-            source_ids=source_ids,
-            evidence=evidence,
-            triggers_fired=triggers,
-            escape_reason="极端分档所需独立信号不足",
-            llm_status=llm_status,
-        )
 
     if quality == "偏薄":
         confidence = "低"
@@ -446,8 +466,8 @@ def build_smoke_data() -> dict:
     return data
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
+def build_parser() -> JsonArgumentParser:
+    ap = JsonArgumentParser(
         description="Retail sentiment panel (宝妈指数) — paste adapter + rules_v0 skeleton"
     )
     ap.add_argument(
@@ -477,7 +497,12 @@ def main() -> int:
         action="store_true",
         help="run built-in connectivity/fixture check",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
 
     try:
         if args.smoke:
@@ -530,6 +555,7 @@ def main() -> int:
         return 0
 
     except Exception as exc:  # noqa: BLE001 — single exit point, structured error
+        log(f"[error] {exc}")
         print(
             json.dumps(
                 {
