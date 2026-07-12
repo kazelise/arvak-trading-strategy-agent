@@ -74,8 +74,12 @@ every acceptance includes reading the actual output files.
   per-claim source attribution; Bull/Base/Bear scenarios only, no point
   targets; no vague language) + journal write
 - **M1**: multi-source synthesis + conversation loop over the brief
-- **M2**: market-data tools (volatility, options positioning) + sentiment
-  panel (incl. retail-FOMO contrarian gauge)
+- **M2-prep** (partial): sentiment panel design + skeleton — closed
+  vocabulary "宝妈指数" (`docs/SENTIMENT.md`), paste-only adapter,
+  `scripts/sentiment_panel.py` rules_v0 + LLM seam reserved. No social
+  crawlers (ToS); Discord remains disabled per M0a.
+- **M2**: market-data tools (volatility, options positioning) + wire
+  sentiment panel into daily brief citation path
 - **M3**: broker read-only integration (paper account first)
 - **M4**: prediction journaling & scoring (make every call falsifiable)
 - **M5**: execution staging behind an explicit human approval gate — never
