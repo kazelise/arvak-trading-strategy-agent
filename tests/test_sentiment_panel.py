@@ -372,6 +372,22 @@ class PrivacyGuardTests(unittest.TestCase):
         self.assertEqual(sid, sp.DEFAULT_SOURCE_ID)
         self.assertTrue(sp.ABSTRACT_SOURCE_ID_RE.fullmatch(sid))
 
+    def test_normalize_source_id_stderr_does_not_echo_raw(self):
+        """Rejected identities must not appear on stderr diagnostics."""
+        import io
+        from contextlib import redirect_stderr
+
+        raw = "RealAlphaChat-VIP"
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            sid = sp.normalize_source_id(raw)
+        err = buf.getvalue()
+        self.assertEqual(sid, sp.DEFAULT_SOURCE_ID)
+        self.assertIn("[privacy]", err)
+        self.assertIn("rejected non-abstract source id", err)
+        self.assertNotIn(raw, err)
+        self.assertNotIn("RealAlphaChat", err)
+
     def test_abstract_source_ids_preserved(self):
         for good in (
             "sentiment-paste-a",
@@ -407,6 +423,39 @@ class PrivacyGuardTests(unittest.TestCase):
             self.assertTrue(sp.ABSTRACT_SOURCE_ID_RE.fullmatch(ev["source_id"]))
             self.assertNotIn("@", ev.get("quote_span", ""))
             self.assertNotIn("http", ev.get("quote_span", "").lower())
+
+    def test_cli_rejected_source_id_absent_from_stdout_and_stderr(self):
+        """Subprocess regression: --source-id real name must not leak to either stream."""
+        identity = "RealAlphaChat-VIP"
+        text = (
+            "怕踏空要上车，同时有人割肉离场心态崩了再也不碰。" * 2
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--source-id",
+                identity,
+                "--text",
+                text,
+                "--as-of",
+                AS_OF,
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn(identity, combined)
+        self.assertNotIn("RealAlphaChat", combined)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["ok"])
+        for sid in payload["data"]["source_ids"]:
+            self.assertTrue(sp.ABSTRACT_SOURCE_ID_RE.fullmatch(sid), sid)
+        # Diagnostics may note a rejection without echoing the value.
+        self.assertIn("[privacy]", proc.stderr)
 
     def test_parent_dir_non_abstract_falls_back(self):
         with tempfile.TemporaryDirectory() as td:

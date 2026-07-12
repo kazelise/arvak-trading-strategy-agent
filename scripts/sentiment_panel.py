@@ -214,7 +214,8 @@ def parse_iso_date(value: str, *, field_name: str = "date") -> date:
 def normalize_source_id(raw: str | None, *, fallback: str = DEFAULT_SOURCE_ID) -> str:
     """Accept only abstract ids; map anything else to the default paste id.
 
-    Real channel/account/server names must never leave the adapter (D2).
+    Real channel/account/server names must never leave the adapter (D2),
+    including diagnostics: never log the rejected raw value to stderr.
     """
     if raw is None:
         return fallback
@@ -222,7 +223,11 @@ def normalize_source_id(raw: str | None, *, fallback: str = DEFAULT_SOURCE_ID) -
     if ABSTRACT_SOURCE_ID_RE.fullmatch(candidate):
         return candidate
     if candidate:
-        log(f"[privacy] rejected non-abstract source id {candidate!r} → {fallback}")
+        # Do not echo the rejected identity — stdout/stderr are both attack surfaces.
+        log(
+            f"[privacy] rejected non-abstract source id "
+            f"(len={len(candidate)}) → {fallback}"
+        )
     return fallback
 
 
